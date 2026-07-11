@@ -17,7 +17,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${SCRIPT_DIR}/../libs"
-MIN_API=23   # forkpty()/openpty() require API 23+ on bionic
+MIN_API=24   # forkpty()/openpty() require API 23+ on bionic
 
 ABIS=("arm64-v8a" "armeabi-v7a" "x86_64")
 TARGETS=("ptycore" "lorie_bridge")
