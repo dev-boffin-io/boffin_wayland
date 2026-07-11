@@ -1,0 +1,49 @@
+name: Build Boffin-Wayland APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: # Actions ট্যাব থেকে ম্যানুয়ালি বিল্ড রান করার জন্য
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+
+      - name: Install Buildozer & Cython
+        run: |
+          pip install --upgrade pip
+          pip install buildozer cython virtualenv
+
+      - name: Build Native C++ Libraries (PTY & Lorie Bridge)
+        run: |
+          # NDK পাথ সেট করা এবং C++ কোড কম্পাইল করা
+          chmod +x cpp/build_native.sh
+          export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
+          ./cpp/build_native.sh
+
+      - name: Build APK with Buildozer
+        run: |
+          # Buildozer দিয়ে Kivy প্রজেক্ট বিল্ড করা
+          # 'yes |' ব্যবহার করা হয়েছে যাতে লাইসেন্স এগ্রিমেন্ট নিজে থেকেই অ্যাক্সেপ্ট হয়ে যায়
+          yes | buildozer android debug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boffin-Wayland-APK
+          path: bin/*.apk
+          retention-days: 7
