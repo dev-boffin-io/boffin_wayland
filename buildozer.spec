@@ -8,8 +8,8 @@ source.dir = python
 source.include_exts = py,png,jpg,kv,atlas
 version = 0.1.0
 
-requirements = python3,kivy==master
-p4a.branch = master
+requirements = python3,kivy==2.3.0
+# p4a.branch = master
 
 orientation = all
 fullscreen = 0
