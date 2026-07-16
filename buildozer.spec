@@ -9,7 +9,6 @@ source.include_exts = py,png,jpg,kv,atlas
 version = 0.1.0
 
 requirements = python3,kivy==2.3.0
-# p4a.branch = master
 
 orientation = all
 fullscreen = 0
@@ -51,3 +50,4 @@ android.allow_backup = 0
 [buildozer]
 log_level = 2
 warn_on_root = 1
+python_version = 3.11
