@@ -37,9 +37,7 @@ jobs:
 
       - name: Build APK with Buildozer
         run: |
-          # Buildozer দিয়ে Kivy প্রজেক্ট বিল্ড করা
-          # 'yes |' ব্যবহার করা হয়েছে যাতে লাইসেন্স এগ্রিমেন্ট নিজে থেকেই অ্যাক্সেপ্ট হয়ে যায়
-          yes | buildozer android debug
+          yes | buildozer android clean debug
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
