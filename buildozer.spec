@@ -8,7 +8,18 @@ source.dir = python
 source.include_exts = py,png,jpg,kv,atlas
 version = 0.1.0
 
-requirements = python3,kivy==2.3.0
+requirements = python3==3.11.9,kivy==2.3.0
+
+# THE ACTUAL FIX: buildozer does NOT use whatever python-for-android was
+# `pip install`-ed in CI - it clones its own copy from GitHub, and defaults
+# to the `master` branch whenever p4a.branch is unset/commented out (see
+# https://github.com/kivy/buildozer/blob/master/buildozer/default.spec).
+# master moves forward continuously; by now it targets Python 3.14, which
+# has no prebuilt wheels for kivy/pyjnius/android, causing exactly the
+# SDL2/wheel build failures we hit. v2024.01.21 is the p4a release that
+# explicitly bumped its Kivy compatibility to 2.3.0 - pin to that tag
+# instead of trusting the "defaults to master" behavior.
+p4a.branch = v2024.01.21
 
 orientation = all
 fullscreen = 0
@@ -50,4 +61,3 @@ android.allow_backup = 0
 [buildozer]
 log_level = 2
 warn_on_root = 1
-python_version = 3.11
