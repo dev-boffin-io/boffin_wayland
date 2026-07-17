@@ -18,10 +18,22 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+        # THE FIX: GitHub's Ubuntu runner ships Java 8/11/17/21/25 side by
+        # side, but JAVA_HOME defaults to 11. `apt-get install openjdk-17-jdk`
+        # (removed below) installs a copy but does NOT change JAVA_HOME, so
+        # Gradle kept picking up Java 11 and the Android Gradle Plugin
+        # (which requires 17) failed. setup-java properly exports JAVA_HOME
+        # (and PATH) for every later step in this job.
+
       - name: Install System Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git zip unzip openjdk-17-jdk autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
+          sudo apt-get install -y git zip unzip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake libffi-dev libssl-dev
 
       - name: Install Buildozer & Cython
         run: |
