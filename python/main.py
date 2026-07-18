@@ -57,6 +57,7 @@ import ssl
 import stat
 import subprocess
 import threading
+import traceback
 import urllib.error
 import urllib.request
 import zipfile
@@ -74,6 +75,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.progressbar import ProgressBar
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
@@ -752,6 +754,8 @@ class TerminalView(Widget):
         self._reader_thread = None
         self._redraw_ev = None
         self._keyboard = None
+        self._ctrl_armed = False
+        self._alt_armed = False
 
         self.bind(pos=self._sync_bg_rect, size=self._sync_bg_rect)
         self.bind(size=self._on_resize)
@@ -781,6 +785,16 @@ class TerminalView(Widget):
     # -- lifecycle ----------------------------------------------------------
 
     def start(self):
+        # Deferred rather than run synchronously: right after add_widget(),
+        # self.size is still Kivy's default widget size (e.g. 100x100), not
+        # the real allocated area - BoxLayout only assigns that on its next
+        # layout pass. Scheduling this for "next frame" guarantees we size
+        # the grid (and tell the PTY its window size) correctly from the
+        # very first render instead of starting tiny and only fixing itself
+        # once _on_resize happens to fire later.
+        Clock.schedule_once(self._start_after_layout, 0)
+
+    def _start_after_layout(self, _dt):
         rows, cols = self._grid_dims_for_size(self.size)
         self.screen.resize(rows, cols)
         self._ensure_row_groups(rows)
@@ -790,6 +804,10 @@ class TerminalView(Widget):
         except PtyCoreError as exc:
             for ch in f"\r\n[Boffin-Wayland] {exc}\r\n":
                 self.parser.feed(ch.encode("utf-8"))
+            self._redraw(0)
+            return
+        except Exception:
+            self._show_internal_error("pty spawn", traceback.format_exc())
             self._redraw(0)
             return
 
@@ -811,12 +829,20 @@ class TerminalView(Widget):
 
     def _read_loop(self):
         while self._running:
-            data = self.pty.read()
-            if not data:
-                if not self.pty.is_alive():
-                    self._running = False
-                continue
-            self.parser.feed(data)  # mutates Screen; marks specific rows/cursor dirty
+            try:
+                data = self.pty.read()
+                if not data:
+                    if not self.pty.is_alive():
+                        self._running = False
+                    continue
+                self.parser.feed(data)  # mutates Screen; marks specific rows/cursor dirty
+            except Exception:
+                # A silent crash here used to mean "terminal stays blank
+                # forever, no visible clue why". Surface it as actual text
+                # in the terminal itself instead - no adb/logcat needed to
+                # see what broke.
+                self._show_internal_error("read loop", traceback.format_exc())
+                self._running = False
 
     # -- canvas row management -----------------------------------------------
 
@@ -863,8 +889,9 @@ class TerminalView(Widget):
 
             fg_rgb = fg or DEFAULT_FG
             tex = self._get_texture(run_text, bold)
-            group.add(Color(fg_rgb[0] / 255, fg_rgb[1] / 255, fg_rgb[2] / 255, 1))
-            group.add(Rectangle(texture=tex, pos=(rx, y), size=(run_w, self._char_h)))
+            if tex is not None:
+                group.add(Color(fg_rgb[0] / 255, fg_rgb[1] / 255, fg_rgb[2] / 255, 1))
+                group.add(Rectangle(texture=tex, pos=(rx, y), size=(run_w, self._char_h)))
 
             if underline:
                 group.add(Color(fg_rgb[0] / 255, fg_rgb[1] / 255, fg_rgb[2] / 255, 1))
@@ -875,32 +902,51 @@ class TerminalView(Widget):
     def _redraw(self, _dt):
         if not self.screen.is_dirty():
             return
-        dirty = self.screen.pop_dirty()
-        rows, cur_row, cur_col, cursor_visible, scroll_offset = self.screen.get_visible_rows()
+        try:
+            dirty = self.screen.pop_dirty()
+            rows, cur_row, cur_col, cursor_visible, scroll_offset = self.screen.get_visible_rows()
 
-        if scroll_offset != 0:
-            # Scrolled into history: row indices in the visible window don't
-            # map 1:1 to live grid row indices, so any change repaints the
-            # whole window. This only happens while the user is browsing
-            # scrollback, not while actively typing at the live prompt.
-            rows_to_redraw = range(len(rows)) if (dirty["all"] or dirty["rows"] or dirty["view"]) else []
-        elif dirty["all"]:
-            rows_to_redraw = range(len(rows))
-        else:
-            rows_to_redraw = sorted(r for r in dirty["rows"] if r < len(rows))
+            if scroll_offset != 0:
+                # Scrolled into history: row indices in the visible window don't
+                # map 1:1 to live grid row indices, so any change repaints the
+                # whole window. This only happens while the user is browsing
+                # scrollback, not while actively typing at the live prompt.
+                rows_to_redraw = range(len(rows)) if (dirty["all"] or dirty["rows"] or dirty["view"]) else []
+            elif dirty["all"]:
+                rows_to_redraw = range(len(rows))
+            else:
+                rows_to_redraw = sorted(r for r in dirty["rows"] if r < len(rows))
 
-        top_y = self.y + self.height - self._char_h
-        for r in rows_to_redraw:
-            if r >= len(self._row_groups):
-                continue
-            self._render_row(self._row_groups[r], rows[r], top_y - r * self._char_h)
+            top_y = self.y + self.height - self._char_h
+            for r in rows_to_redraw:
+                if r >= len(self._row_groups):
+                    continue
+                try:
+                    self._render_row(self._row_groups[r], rows[r], top_y - r * self._char_h)
+                except Exception:
+                    # Isolate a single bad row instead of leaving the whole
+                    # screen blank - the rest of the rows still render.
+                    self._show_internal_error(f"render row {r}", traceback.format_exc())
 
-        if cursor_visible:
-            self._cursor_color.a = 0.55
-            self._cursor_rect.pos = (self.x + cur_col * self._char_w, top_y - cur_row * self._char_h)
-            self._cursor_rect.size = (self._char_w, self._char_h)
-        else:
-            self._cursor_color.a = 0.0
+            if cursor_visible:
+                self._cursor_color.a = 0.55
+                self._cursor_rect.pos = (self.x + cur_col * self._char_w, top_y - cur_row * self._char_h)
+                self._cursor_rect.size = (self._char_w, self._char_h)
+            else:
+                self._cursor_color.a = 0.0
+        except Exception:
+            self._show_internal_error("redraw", traceback.format_exc())
+
+    def _show_internal_error(self, where: str, tb_text: str):
+        """Feeds a visible error banner straight into the terminal's own
+        screen buffer, so a rendering/read-loop bug shows up as on-screen
+        text instead of a silently blank terminal with no clue why. Uses
+        SGR red (\\x1b[31m) so it stands out from normal shell output."""
+        message = f"\r\n\x1b[31m[Boffin-Wayland internal error in {where}]\r\n{tb_text}\x1b[0m\r\n"
+        try:
+            self.parser.feed(message.encode("utf-8", errors="replace"))
+        except Exception:
+            pass  # if even this fails, there's nothing more we can safely do here
 
     def _sync_bg_rect(self, *_args):
         self._bg_rect.pos = self.pos
@@ -1003,7 +1049,67 @@ class TerminalView(Widget):
         if self._keyboard is None:
             return
         self.screen.scroll_to_bottom()
+
+        # Sticky CTRL/ALT from the extra-keys toolbar (see arm_ctrl()/
+        # arm_alt() below): apply to just the next character, then reset -
+        # soft keyboards don't send real modifier-held key events, so this
+        # "tap modifier, then tap a letter" pattern is how Termux-style
+        # extra-keys rows work around that.
+        if self._ctrl_armed and text:
+            self._ctrl_armed = False
+            ch = text[0]
+            if ch.isalpha():
+                self.pty.write(bytes([ord(ch.upper()) - 64]))
+            remainder = text[1:]
+            if remainder:
+                self.pty.write(remainder.encode("utf-8"))
+            return
+        if self._alt_armed and text:
+            self._alt_armed = False
+            self.pty.write(b"\x1b" + text[0].encode("utf-8"))
+            remainder = text[1:]
+            if remainder:
+                self.pty.write(remainder.encode("utf-8"))
+            return
+
         self.pty.write(text.encode("utf-8"))
+
+    # -- extra-keys toolbar public API (see build_extra_keys_bar() in the
+    # App class, which wires buttons to these) ---------------------------
+
+    def send_special_key(self, key_name: str):
+        """Writes one of KEY_ESCAPES' bytes directly - used by ESC/TAB/
+        arrow/Home/End/PgUp/PgDn buttons on the extra-keys toolbar."""
+        escape = self.KEY_ESCAPES.get(key_name)
+        if escape:
+            self.screen.scroll_to_bottom()
+            self.pty.write(escape)
+
+    def send_raw(self, data: bytes):
+        """Writes raw bytes directly - used for keys with no natural
+        `keycode` name, e.g. '/' and '-' on the extra-keys toolbar."""
+        self.screen.scroll_to_bottom()
+        self.pty.write(data)
+
+    def arm_ctrl(self):
+        """Arms CTRL for the next character typed (from either the soft
+        keyboard or another toolbar tap). Toggling it off again cancels."""
+        self._ctrl_armed = not self._ctrl_armed
+        self._alt_armed = False
+
+    def arm_alt(self):
+        """Arms ALT (sends ESC + next char, the standard meta-key
+        convention) for the next character typed."""
+        self._alt_armed = not self._alt_armed
+        self._ctrl_armed = False
+
+    @property
+    def ctrl_armed(self) -> bool:
+        return self._ctrl_armed
+
+    @property
+    def alt_armed(self) -> bool:
+        return self._alt_armed
 
 
 
@@ -1190,8 +1296,71 @@ class BoffinWaylandApp(App):
 
         pty = PtyCore()
         self.term = TerminalView(pty, font_name=getattr(self, "font_path", None))
+
+        self.root_layout.add_widget(self._build_extra_keys_bar())
         self.root_layout.add_widget(self.term)
         self.term.start()
+
+    def _build_extra_keys_bar(self):
+        """A Termux-style row of extra keys (ESC/TAB/CTRL/ALT/arrows/Home/
+        End/PgUp/PgDn/common symbols) above the terminal. Soft keyboards
+        generally don't send real key-down events for these, so without
+        this row Ctrl+C, Tab-completion, and Esc (needed for vim/nano)
+        wouldn't be reachable at all."""
+        bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=4, padding=(4, 2))
+        bar.bind(minimum_width=bar.setter("width"))
+
+        def add_key(label, on_press, width=56):
+            btn = Button(text=label, size_hint_x=None, width=width)
+            btn.bind(on_press=on_press)
+            bar.add_widget(btn)
+            return btn
+
+        def special(name):
+            return lambda _inst: self.term.send_special_key(name)
+
+        def raw(data: bytes):
+            return lambda _inst: self.term.send_raw(data)
+
+        add_key("ESC", special("escape"))
+        add_key("TAB", special("tab"))
+        self.ctrl_btn = add_key("CTRL", lambda _inst: self._toggle_ctrl())
+        self.alt_btn = add_key("ALT", lambda _inst: self._toggle_alt())
+        add_key("\u2190", special("left"))
+        add_key("\u2193", special("down"))
+        add_key("\u2191", special("up"))
+        add_key("\u2192", special("right"))
+        add_key("HOME", special("home"))
+        add_key("END", special("end"))
+        add_key("PGUP", special("pageup"))
+        add_key("PGDN", special("pagedown"))
+        add_key("/", raw(b"/"), width=40)
+        add_key("-", raw(b"-"), width=40)
+        add_key("|", raw(b"|"), width=40)
+        add_key("~", raw(b"~"), width=40)
+
+        scroll = ScrollView(
+            size_hint=(1, None), height=44, do_scroll_x=True, do_scroll_y=False,
+            bar_width=4,
+        )
+        scroll.add_widget(bar)
+        return scroll
+
+    def _toggle_ctrl(self, *_args):
+        if self.term:
+            self.term.arm_ctrl()
+            self._refresh_modifier_buttons()
+
+    def _toggle_alt(self, *_args):
+        if self.term:
+            self.term.arm_alt()
+            self._refresh_modifier_buttons()
+
+    def _refresh_modifier_buttons(self):
+        armed_color = (0.25, 0.55, 0.95, 1)
+        idle_color = (1, 1, 1, 1)
+        self.ctrl_btn.background_color = armed_color if self.term.ctrl_armed else idle_color
+        self.alt_btn.background_color = armed_color if self.term.alt_armed else idle_color
 
     def _toggle_x11_display(self, _instance):
         if not self.lorie_bridge.available():

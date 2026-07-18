@@ -140,6 +140,43 @@ system paths → **download JetBrains Mono automatically** on first launch →
 finally Kivy's built-in default font (not monospace; columns will drift
 slightly if you ever end up here, e.g. fully offline with no system font).
 
+## Debugging a blank terminal / extra-keys toolbar
+
+If the terminal screen ever shows up completely blank with no `$` prompt:
+it now won't stay silently blank. `TerminalView._redraw()` and the PTY
+reader loop are wrapped so that any exception gets fed straight into the
+terminal's own screen buffer as visible red (`\x1b[31m`) text with a full
+traceback - no `adb logcat` needed to see what broke. A bad single row also
+no longer takes down the whole redraw; only that row shows the error.
+
+Two related hardening fixes landed alongside this:
+- `TerminalView.start()` now defers its actual startup (grid sizing + PTY
+  spawn) by one frame via `Clock.schedule_once`, instead of running
+  synchronously the instant the widget is added to the layout - at that
+  exact synchronous moment `self.size` is still Kivy's default widget size
+  (not the real allocated area yet, since BoxLayout only assigns that on
+  its next layout pass), so starting immediately could size the very first
+  grid/PTY window wrong.
+- `_render_row()` now guards against `CoreLabel` ever returning a `None`
+  texture for a run (rather than passing `texture=None` into a
+  `Rectangle`, which would otherwise silently draw an untextured solid
+  color block over that run).
+
+**Extra-keys toolbar** (new): a horizontally-scrolling row of buttons above
+the terminal - ESC, TAB, CTRL, ALT, arrows, Home, End, PgUp, PgDn, and a
+few common symbols (`/ - | ~`) - because soft keyboards generally don't
+send real key-down events for these, so without it Ctrl+C, Tab-completion,
+and Esc (needed for vim/nano) would be unreachable. CTRL and ALT are
+"sticky": tap once to arm, then the *next* character typed (from the
+toolbar or the soft keyboard) is sent as Ctrl+<char> or ESC+<char>
+respectively, then it auto-disarms - the standard pattern Termux's own
+extra-keys row uses, since soft keyboards don't deliver real held-modifier
+events either. Verified with tests: CTRL+'c' sends `\x03`, ALT+'x' sends
+`ESC x`, arming one modifier cancels the other, normal typing is
+unaffected when nothing's armed.
+
+
+
 ## X11/Wayland display - architecture decision (read before building further)
 
 This is the biggest remaining milestone, so the decisions made here matter
