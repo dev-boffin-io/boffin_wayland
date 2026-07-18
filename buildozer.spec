@@ -5,7 +5,10 @@ package.name = wayland
 package.domain = com.boffin
 
 source.dir = python
-source.include_exts = py,png,jpg,kv,atlas
+source.include_exts = py,png,jpg,kv,atlas,ttf
+# busybox-aarch64 has no file extension, so include_exts (extension-based)
+# won't catch it - include_patterns (glob-based) is needed for that.
+source.include_patterns = assets/busybox/*
 version = 0.1.0
 
 requirements = python3==3.11.9,kivy==2.3.0,certifi

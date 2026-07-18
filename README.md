@@ -20,7 +20,8 @@ boffin_wayland/
 ├── python/
 │   ├── main.py           # Kivy app: bootstrap UI, PtyCore bridge, TerminalView, LorieBridge
 │   ├── vt100_parser.py   # VT100/ANSI state machine + character-grid Screen
-│   └── assets/fonts/     # drop a monospace .ttf here (see "Fonts" below)
+│   ├── assets/fonts/     # drop a monospace .ttf here (see "Fonts" below)
+│   └── assets/busybox/   # bundled static busybox-aarch64 binary (see "BusyBox" below)
 ├── buildozer.spec
 └── README.md
 ```
@@ -102,6 +103,34 @@ boffin_wayland/
 - Window resize recomputes rows/cols from pixel size and calls both
   `Screen.resize()` and `pty.resize()` (native `ioctl TIOCSWINSZ`).
 - Clean process teardown (`pty_terminate`) on app exit.
+
+## BusyBox
+
+Right after the Termux bootstrap succeeds, `BusyboxManager` installs a
+bundled static BusyBox binary (`python/assets/busybox/busybox-aarch64`,
+BusyBox v1.36.1) into `PREFIX/bin/busybox`, then asks the binary itself
+which applets it supports (`busybox --list` - not a hardcoded list, so this
+stays correct if you swap in a different BusyBox build later) and creates
+a symlink for each applet name in `PREFIX/bin/` **only if that name doesn't
+already exist there**. This fills in extra commands the minimal Termux
+bootstrap doesn't ship (`awk`, `sed`, `vi`, `xxd`, `tar`, ...) without ever
+overwriting or shadowing the bootstrap's own real binaries (`bash`, `apt`,
+`dpkg`, etc. stay exactly as Termux provides them) - verified with
+standalone tests (existing binaries never get clobbered, re-running links
+zero new symlinks, non-aarch64 devices are skipped cleanly rather than
+crashing on a wrong-arch exec).
+
+Not fatal if it fails or is skipped (e.g. on a non-aarch64 device, or if
+the bundled binary is missing from a given build) - bash/sh from the
+Termux bootstrap already work fine on their own; BusyBox just adds extra
+commands on top. A status line explains what happened either way.
+
+To bundle a different/updated BusyBox build, drop the binary at
+`python/assets/busybox/busybox-aarch64` (must stay statically linked -
+Termux's own bionic-linked libraries aren't guaranteed to satisfy a
+dynamically-linked BusyBox) and it'll be picked up automatically; no code
+changes needed unless you're adding a second architecture (in which case
+extend `BusyboxManager.BUNDLED_ARCH`/`BUNDLED_FILENAME` to pick per-arch).
 
 ## Fonts
 

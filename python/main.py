@@ -55,6 +55,7 @@ import platform
 import shutil
 import ssl
 import stat
+import subprocess
 import threading
 import urllib.error
 import urllib.request
@@ -369,6 +370,136 @@ class BootstrapManager:
         if os.path.exists(self.prefix):
             shutil.rmtree(self.prefix)
         shutil.move(staging, self.prefix)
+
+
+class BusyboxError(RuntimeError):
+    pass
+
+
+class BusyboxManager:
+    """
+    Installs a bundled static BusyBox binary into PREFIX/bin and symlinks
+    every applet it supports (ls, grep, sed, awk, tar, vi, xxd, ...) into
+    PREFIX/bin too - but ONLY for command names that don't already exist
+    there. This fills in extra commands the minimal Termux bootstrap
+    doesn't ship, without ever overwriting or shadowing the bootstrap's
+    own real binaries (bash, apt, dpkg, etc. stay exactly as Termux
+    provides them) - matching the actual goal ("extra commands besides
+    the basics"), not a bash/coreutils replacement.
+
+    Unlike BootstrapManager and the font downloader, this binary is
+    bundled directly in the APK under assets/busybox/ rather than
+    downloaded - it was hand-built for this project, so there's no
+    network step or release lookup needed here.
+
+    Currently only ships an aarch64 build (see assets/busybox/). On any
+    other device architecture this is skipped with a clear status message
+    rather than attempted - silently failing to exec a wrong-arch ELF
+    would be a confusing crash instead.
+
+    Not fatal if it fails: BusyBox is a nice-to-have, not required for the
+    terminal core (bash/sh from the bootstrap already work on their own).
+    Callers should catch BusyboxError and continue rather than blocking
+    the whole app on it.
+    """
+
+    BUNDLED_ARCH = "aarch64"
+    BUNDLED_FILENAME = "busybox-aarch64"
+
+    def __init__(self, prefix: str, on_status=None, on_progress=None):
+        self.prefix = prefix
+        self.on_status = on_status or (lambda msg: None)
+        self.on_progress = on_progress or (lambda frac: None)
+
+    # -- public API -----------------------------------------------------
+
+    def installed(self) -> bool:
+        return os.path.exists(os.path.join(self.prefix, "bin", "busybox"))
+
+    def ensure_busybox(self):
+        """Idempotent: does nothing if PREFIX/bin/busybox already exists.
+        Skips (not an error) if the device isn't aarch64 or the bundled
+        binary is missing from this build."""
+        if self.installed():
+            self.on_status("BusyBox already installed.")
+            self.on_progress(1.0)
+            return
+
+        machine = platform.machine() or os.uname().machine
+        arch = ARCH_MAP.get(machine)
+        if arch != self.BUNDLED_ARCH:
+            self.on_status(
+                f"BusyBox skipped: only an {self.BUNDLED_ARCH} build is bundled "
+                f"(this device is {arch or machine!r})."
+            )
+            self.on_progress(1.0)
+            return
+
+        bundled_path = self._bundled_busybox_path()
+        if not os.path.exists(bundled_path):
+            self.on_status(f"BusyBox skipped: bundled binary not found at {bundled_path}.")
+            self.on_progress(1.0)
+            return
+
+        bin_dir = os.path.join(self.prefix, "bin")
+        try:
+            os.makedirs(bin_dir, exist_ok=True)
+            dest = os.path.join(bin_dir, "busybox")
+
+            self.on_status("Installing BusyBox...")
+            shutil.copy2(bundled_path, dest)
+            st = os.stat(dest)
+            os.chmod(dest, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except OSError as exc:
+            raise BusyboxError(f"Could not install busybox binary: {exc}") from exc
+
+        self.on_status("Linking BusyBox applets...")
+        applets = self._list_applets(dest)
+        linked = self._link_applets(bin_dir, applets)
+
+        skipped = len(applets) - linked
+        self.on_status(
+            f"BusyBox ready ({linked} new command(s) linked"
+            + (f", {skipped} already present)" if skipped else ")")
+        )
+        self.on_progress(1.0)
+
+    # -- internals --------------------------------------------------------
+
+    def _bundled_busybox_path(self) -> str:
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(here, "assets", "busybox", self.BUNDLED_FILENAME)
+
+    @staticmethod
+    def _list_applets(busybox_path: str):
+        """Asks the binary itself which applets it supports (`busybox --list`)
+        rather than hardcoding a list, so this stays correct across whatever
+        BusyBox build/version actually gets bundled."""
+        try:
+            result = subprocess.run(
+                [busybox_path, "--list"],
+                capture_output=True, text=True, timeout=10, check=True,
+            )
+            return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+    def _link_applets(self, bin_dir: str, applets) -> int:
+        linked = 0
+        total = len(applets) or 1
+        for i, name in enumerate(applets):
+            link_path = os.path.join(bin_dir, name)
+            # os.path.lexists (not exists) so we don't clobber even a
+            # dangling symlink left over from some earlier partial state -
+            # "already present" always wins over BusyBox's version.
+            if not os.path.lexists(link_path):
+                try:
+                    os.symlink("busybox", link_path)
+                    linked += 1
+                except OSError:
+                    pass  # best-effort - skip anything we can't link and move on
+            self.on_progress((i + 1) / total)
+        return linked
 
 
 class PtyCoreError(RuntimeError):
@@ -1015,6 +1146,18 @@ class BoffinWaylandApp(App):
         except BootstrapError as exc:
             self._on_bootstrap_status(f"[ERROR] Bootstrap failed: {exc}")
             return
+
+        busybox_manager = BusyboxManager(
+            PREFIX,
+            on_status=self._on_bootstrap_status,
+            on_progress=self._on_bootstrap_progress,
+        )
+        try:
+            busybox_manager.ensure_busybox()
+        except BusyboxError as exc:
+            # Not fatal - bash/sh from the Termux bootstrap already work on
+            # their own; BusyBox just adds extra commands on top.
+            self._on_bootstrap_status(f"[WARNING] BusyBox install failed: {exc} (continuing without it)")
 
         self.font_path = _ensure_monospace_font(on_status=self._on_bootstrap_status)
 
