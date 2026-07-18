@@ -53,6 +53,7 @@ import json
 import os
 import platform
 import shutil
+import ssl
 import stat
 import threading
 import urllib.error
@@ -84,6 +85,37 @@ from vt100_parser import Screen, VTParser, DEFAULT_FG, DEFAULT_BG
 PREFIX = "/data/data/com.boffin.wayland/files/usr"
 HOME = "/data/data/com.boffin.wayland/files/home"
 LIB_NAME = "libptycore.so"  # bundled by buildozer, loaded from the app's native lib dir
+
+# ---------------------------------------------------------------------------
+# HTTPS certificate verification.
+#
+# python-for-android's cross-compiled CPython for Android does NOT wire up
+# a system CA trust store the way a desktop Python install does (it has no
+# access to Android's certificate store, and ships no CA bundle of its own).
+# Without this, every urllib.request.urlopen() call to an https:// URL fails
+# on-device with:
+#   ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED]
+#   certificate verify failed: unable to get local issuer certificate
+# even though the exact same code works fine on a desktop dev machine (which
+# does have a system CA store). The fix is to point the SSL context at the
+# `certifi` package's bundled CA file explicitly - certifi is pulled in by
+# buildozer.spec's requirements (it's also a transitive dependency of the
+# `requests` recipe, but we depend on it directly here since we only use
+# the stdlib urllib, not requests).
+# ---------------------------------------------------------------------------
+
+
+def _https_context():
+    """Returns an SSL context that verifies against certifi's CA bundle.
+    Falls back to Python's own default context (with a note) if certifi
+    isn't importable for some reason, rather than silently disabling
+    verification - a failed download is better than an unverified one."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
 
 # ---------------------------------------------------------------------------
 # Bootstrap source: the official Termux rootfs archives published on
@@ -201,7 +233,7 @@ class BootstrapManager:
             headers={"Accept": "application/vnd.github+json", "User-Agent": "boffin-wayland"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=30, context=_https_context()) as resp:
                 releases = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError) as exc:
             raise BootstrapError(f"Could not reach GitHub releases API: {exc}") from exc
@@ -239,7 +271,7 @@ class BootstrapManager:
         self.on_status("Downloading bootstrap...")
         req = urllib.request.Request(url, headers={"User-Agent": "boffin-wayland"})
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp, open(dest_path, "wb") as out:
+            with urllib.request.urlopen(req, timeout=60, context=_https_context()) as resp, open(dest_path, "wb") as out:
                 total_size = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 block_size = 1 << 16
@@ -497,7 +529,7 @@ def _ensure_monospace_font(on_status=None):
     status("No monospace font found - downloading JetBrains Mono...")
     try:
         req = urllib.request.Request(FONT_DOWNLOAD_URL, headers={"User-Agent": "boffin-wayland"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=60, context=_https_context()) as resp:
             data = resp.read()
         tmp_path = dest + ".part"
         with open(tmp_path, "wb") as f:

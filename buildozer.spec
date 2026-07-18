@@ -8,7 +8,7 @@ source.dir = python
 source.include_exts = py,png,jpg,kv,atlas
 version = 0.1.0
 
-requirements = python3==3.11.9,kivy==2.3.0
+requirements = python3==3.11.9,kivy==2.3.0,certifi
 
 # THE ACTUAL FIX: buildozer does NOT use whatever python-for-android was
 # `pip install`-ed in CI - it clones its own copy from GitHub, and defaults
