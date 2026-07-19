@@ -142,40 +142,68 @@ slightly if you ever end up here, e.g. fully offline with no system font).
 
 ## Debugging a blank terminal / extra-keys toolbar
 
-If the terminal screen ever shows up completely blank with no `$` prompt:
-it now won't stay silently blank. `TerminalView._redraw()` and the PTY
-reader loop are wrapped so that any exception gets fed straight into the
-terminal's own screen buffer as visible red (`\x1b[31m`) text with a full
-traceback - no `adb logcat` needed to see what broke. A bad single row also
-no longer takes down the whole redraw; only that row shows the error.
+An earlier revision replaced the terminal's text rendering with a hand-
+built "raw `CoreLabel` texture per run, drawn via `canvas` `Rectangle`s"
+renderer. On a real device this showed a completely blank terminal - no
+crash, no exception, just nothing visible - while the exact same textures
+tested fine in a desktop GL context. The likely cause, confirmed by
+inspecting the actual texture sizes involved: `CoreLabel` produces a
+tightly-sized (non-power-of-two) texture matching the rendered text's
+pixel dimensions (e.g. 76x17 for "bash-5.2$ ls"), and that renderer then
+force-*stretched* it via `Rectangle(size=(run_w, char_h))` to an unrelated
+target size to fill the fixed-width terminal cell grid. Non-uniform
+stretching of an NPOT texture is a known rough edge on some Android GLES
+driver/filtering combinations, even though it's completely fine on a
+desktop OpenGL implementation (which is why every earlier sandbox test of
+this code looked correct).
 
-Two related hardening fixes landed alongside this:
-- `TerminalView.start()` now defers its actual startup (grid sizing + PTY
+**Fix**: text rendering now uses a real `kivy.uix.Label(markup=True)` -
+the exact same code path every `Button`/`Label` elsewhere in this app
+already renders successfully with - which always draws its texture at its
+own native size (never force-stretched), sidestepping that whole class of
+driver quirk. Per-cell background colors (still needed for nano's status
+bar, htop's highlighted rows, reverse video - the reason the raw-texture
+renderer was attempted in the first place) are now handled by a *separate*
+`InstructionGroup` of plain solid-color `Rectangle`s (grouped only by
+background color, no texture involved at all) drawn behind the `Label`.
+
+Trade-off: this rebuilds the whole label text + background rect list on
+every dirty redraw tick instead of only touched rows. At the `REDRAW_HZ`
+throttle (20/sec default) this is still cheap enough not to matter in
+practice; reintroducing per-row diffing on top of this safer foundation is
+a reasonable future optimization once basic rendering is confirmed
+rock-solid across more real devices.
+
+Two related hardening fixes landed alongside this (kept from the previous
+revision, still valuable regardless of the above):
+- `TerminalView._redraw()` and the PTY reader loop are wrapped so that any
+  exception gets fed straight into the terminal's own screen buffer as
+  visible red (`\x1b[31m`) text with a full traceback - no `adb logcat`
+  needed to see what broke, for whatever the *next* rendering surprise
+  turns out to be.
+- `TerminalView.start()` defers its actual startup (grid sizing + PTY
   spawn) by one frame via `Clock.schedule_once`, instead of running
   synchronously the instant the widget is added to the layout - at that
   exact synchronous moment `self.size` is still Kivy's default widget size
-  (not the real allocated area yet, since BoxLayout only assigns that on
-  its next layout pass), so starting immediately could size the very first
-  grid/PTY window wrong.
-- `_render_row()` now guards against `CoreLabel` ever returning a `None`
-  texture for a run (rather than passing `texture=None` into a
-  `Rectangle`, which would otherwise silently draw an untextured solid
-  color block over that run).
+  (not the real allocated area yet, since `BoxLayout` only assigns that on
+  its next layout pass), so starting immediately could size the very
+  first grid/PTY window wrong.
 
-**Extra-keys toolbar** (new): a horizontally-scrolling row of buttons above
-the terminal - ESC, TAB, CTRL, ALT, arrows, Home, End, PgUp, PgDn, and a
-few common symbols (`/ - | ~`) - because soft keyboards generally don't
-send real key-down events for these, so without it Ctrl+C, Tab-completion,
-and Esc (needed for vim/nano) would be unreachable. CTRL and ALT are
-"sticky": tap once to arm, then the *next* character typed (from the
-toolbar or the soft keyboard) is sent as Ctrl+<char> or ESC+<char>
-respectively, then it auto-disarms - the standard pattern Termux's own
-extra-keys row uses, since soft keyboards don't deliver real held-modifier
-events either. Verified with tests: CTRL+'c' sends `\x03`, ALT+'x' sends
-`ESC x`, arming one modifier cancels the other, normal typing is
-unaffected when nothing's armed.
-
-
+**Extra-keys toolbar**: a horizontally-scrolling row of buttons above the
+terminal - ESC, TAB, CTRL, ALT, arrows, Home, End, PgUp, PgDn, and a few
+common symbols (`/ - | ~`) - because soft keyboards generally don't send
+real key-down events for these, so without it Ctrl+C, Tab-completion, and
+Esc (needed for vim/nano) would be unreachable. CTRL and ALT are "sticky":
+tap once to arm, then the *next* character typed (from the toolbar or the
+soft keyboard) is sent as Ctrl+<char> or ESC+<char> respectively, then it
+auto-disarms - the standard pattern Termux's own extra-keys row uses,
+since soft keyboards don't deliver real held-modifier events either.
+Verified with tests: CTRL+'c' sends `\x03`, ALT+'x' sends `ESC x`, arming
+one modifier cancels the other, normal typing is unaffected when nothing's
+armed. (The arrow-key glyphs may show as tofu/[] boxes if the active font
+doesn't include those Unicode arrow characters - cosmetic only, the keys
+still work; swap in a font with better symbol coverage if this bothers
+you.)
 
 ## X11/Wayland display - architecture decision (read before building further)
 

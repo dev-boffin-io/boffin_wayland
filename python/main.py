@@ -61,7 +61,6 @@ import traceback
 import urllib.error
 import urllib.request
 import zipfile
-from collections import OrderedDict
 from ctypes import (
     CDLL, c_char_p, c_int, POINTER, byref, create_string_buffer
 )
@@ -79,7 +78,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
-from vt100_parser import Screen, VTParser, DEFAULT_FG, DEFAULT_BG
+from vt100_parser import Screen, VTParser, render_markup, DEFAULT_FG, DEFAULT_BG
 
 # ---------------------------------------------------------------------------
 # Custom environment - deliberately different from real Termux so the two
@@ -679,21 +678,28 @@ class TerminalView(Widget):
     """
     The VT100-aware terminal surface.
 
-    Rendering: canvas-based, not a markup Label. Each screen row owns one
-    kivy.graphics.InstructionGroup; within a row, consecutive cells sharing
-    the same (fg, bg, bold, underline, reverse) are merged into a single
-    "run" and drawn as: an optional Color+Rectangle for the background,
-    then a Color+Rectangle using a small cached glyph-shape texture (tinted
-    by the preceding Color, the same technique kivy.uix.label uses
-    internally) for the foreground text, then an optional thin Rectangle
-    for underline. This is what makes per-cell BACKGROUND colors and
-    reverse video (nano's status bar, htop's highlighted rows) render
-    correctly, which a single markup Label can't do.
+    Rendering: a hybrid approach, chosen after a hand-built "raw CoreLabel
+    texture per run, drawn via canvas Rectangles" renderer shipped in an
+    earlier revision rendered nothing visible on a real device (no
+    exception, no crash - it just never showed text; never conclusively
+    diagnosed, see README). This version instead uses:
+      - a real kivy.uix.Label (markup=True) for all foreground text/bold/
+        underline - the exact same rendering path every Button and Label
+        elsewhere in this app already uses successfully, so it's a known-
+        working code path rather than a hand-rolled one.
+      - a separate kivy.graphics.InstructionGroup (_bg_group), rebuilt each
+        redraw, drawing one Rectangle per contiguous same-background-color
+        run - since Kivy's text markup has no background-color span, this
+        is still needed for nano's status bar / htop's highlighted rows /
+        reverse video to render correctly.
+      - a canvas.after Rectangle for the cursor block, as before.
 
-    Selective redraw: Screen.pop_dirty() reports exactly which row indices
-    changed plus a separate cursor-only flag. TerminalView only rebuilds
-    the InstructionGroups for rows that changed - moving the cursor or
-    editing one line does not touch the other rows' cached instructions.
+    This trades away the earlier version's per-row selective redraw (it
+    now rebuilds the whole label text + background list on every dirty
+    tick) for reliability. At the REDRAW_HZ throttle this is still cheap
+    enough not to matter; reintroducing per-row diffing on top of this
+    safer foundation is a reasonable future optimization once the basic
+    rendering is confirmed rock-solid on real devices.
 
     Scrollback: mouse wheel / touch-drag calls Screen.scroll_view(), which
     is a no-op while an app is using the alternate screen buffer
@@ -708,7 +714,6 @@ class TerminalView(Widget):
     """
 
     REDRAW_HZ = 20
-    TEXTURE_CACHE_MAX = 800
     SCROLL_WHEEL_LINES = 3
 
     KEY_ESCAPES = {
@@ -737,13 +742,34 @@ class TerminalView(Widget):
         self.parser = VTParser(self.screen)
 
         self._char_w, self._char_h = self._measure_char_cell()
-        self._texture_cache = OrderedDict()
 
         with self.canvas.before:
             Color(DEFAULT_BG[0] / 255, DEFAULT_BG[1] / 255, DEFAULT_BG[2] / 255, 1)
             self._bg_rect = Rectangle(pos=self.pos, size=self.size)
+            # Per-cell background-color runs are drawn here, behind the
+            # text label, rebuilt each redraw tick from the current grid.
+            self._bg_group = InstructionGroup()
+            self.canvas.before.add(self._bg_group)
 
-        self._row_groups = []  # one InstructionGroup per visible screen row
+        # Text rendering: a real kivy.uix.Label with markup=True - the same
+        # proven code path used by every Button/Label elsewhere in this app
+        # (as opposed to an earlier attempt at hand-built CoreLabel-texture-
+        # per-run canvas drawing, which rendered nothing on-device for
+        # reasons that weren't successfully diagnosed - see README). Only
+        # foreground color/bold/underline render this way (Kivy markup has
+        # no background-color span), which is why per-cell backgrounds are
+        # still handled separately via _bg_group above.
+        self.text_label = Label(
+            markup=True,
+            font_name=self.font_name,
+            font_size=self.font_size,
+            halign="left",
+            valign="top",
+            color=(DEFAULT_FG[0] / 255, DEFAULT_FG[1] / 255, DEFAULT_FG[2] / 255, 1),
+            size_hint=(None, None),
+            text_size=(None, None),
+        )
+        self.add_widget(self.text_label)
 
         self._cursor_color = Color(0.8, 0.8, 0.8, 0.0)
         self._cursor_rect = Rectangle(pos=(0, 0), size=(self._char_w, self._char_h))
@@ -768,20 +794,6 @@ class TerminalView(Widget):
         w, h = probe.texture.size
         return max(1, w), max(1, int(h * 1.05))
 
-    def _get_texture(self, text, bold):
-        key = (text, bold)
-        tex = self._texture_cache.get(key)
-        if tex is not None:
-            self._texture_cache.move_to_end(key)
-            return tex
-        label = CoreLabel(text=text, font_name=self.font_name, font_size=self.font_size, bold=bold)
-        label.refresh()
-        tex = label.texture
-        self._texture_cache[key] = tex
-        if len(self._texture_cache) > self.TEXTURE_CACHE_MAX:
-            self._texture_cache.popitem(last=False)
-        return tex
-
     # -- lifecycle ----------------------------------------------------------
 
     def start(self):
@@ -797,7 +809,6 @@ class TerminalView(Widget):
     def _start_after_layout(self, _dt):
         rows, cols = self._grid_dims_for_size(self.size)
         self.screen.resize(rows, cols)
-        self._ensure_row_groups(rows)
 
         try:
             self.pty.spawn_shell(rows=rows, cols=cols)
@@ -844,89 +855,53 @@ class TerminalView(Widget):
                 self._show_internal_error("read loop", traceback.format_exc())
                 self._running = False
 
-    # -- canvas row management -----------------------------------------------
+    # -- background-color runs (drawn behind the text Label) ---------------
 
-    def _ensure_row_groups(self, count):
-        while len(self._row_groups) < count:
-            g = InstructionGroup()
-            self.canvas.add(g)
-            self._row_groups.append(g)
-        while len(self._row_groups) > count:
-            g = self._row_groups.pop()
-            self.canvas.remove(g)
-
-    def _render_row(self, group, cells, y):
-        group.clear()
-        n = len(cells)
-        col = 0
-        while col < n:
-            cell = cells[col]
-            fg, bg = cell.fg, cell.bg
-            if cell.reverse:
-                fg, bg = (bg or DEFAULT_BG), (fg or DEFAULT_FG)
-            bold, underline = cell.bold, cell.underline
-
-            run_start = col
-            run_text = cell.ch or " "
-            col += 1
-            while col < n:
-                c2 = cells[col]
-                fg2, bg2 = c2.fg, c2.bg
-                if c2.reverse:
-                    fg2, bg2 = (bg2 or DEFAULT_BG), (fg2 or DEFAULT_FG)
-                if (fg2, bg2, c2.bold, c2.underline) != (fg, bg, bold, underline):
-                    break
-                run_text += (c2.ch or " ")
+    def _render_backgrounds(self, rows, top_y):
+        self._bg_group.clear()
+        n_cols = len(rows[0]) if rows else 0
+        for r, row in enumerate(rows):
+            y = top_y - r * self._char_h
+            col = 0
+            while col < n_cols:
+                cell = row[col]
+                fg, bg = cell.fg, cell.bg
+                if cell.reverse:
+                    fg, bg = (bg or DEFAULT_BG), (fg or DEFAULT_FG)
+                run_start = col
                 col += 1
+                while col < n_cols:
+                    c2 = row[col]
+                    fg2, bg2 = c2.fg, c2.bg
+                    if c2.reverse:
+                        fg2, bg2 = (bg2 or DEFAULT_BG), (fg2 or DEFAULT_FG)
+                    if bg2 != bg:
+                        break
+                    col += 1
+                if bg is not None:
+                    run_len = col - run_start
+                    self._bg_group.add(Color(bg[0] / 255, bg[1] / 255, bg[2] / 255, 1))
+                    self._bg_group.add(Rectangle(
+                        pos=(self.x + run_start * self._char_w, y),
+                        size=(run_len * self._char_w, self._char_h),
+                    ))
 
-            run_len = col - run_start
-            run_w = run_len * self._char_w
-            rx = self.x + run_start * self._char_w
-
-            if bg is not None:
-                group.add(Color(bg[0] / 255, bg[1] / 255, bg[2] / 255, 1))
-                group.add(Rectangle(pos=(rx, y), size=(run_w, self._char_h)))
-
-            fg_rgb = fg or DEFAULT_FG
-            tex = self._get_texture(run_text, bold)
-            if tex is not None:
-                group.add(Color(fg_rgb[0] / 255, fg_rgb[1] / 255, fg_rgb[2] / 255, 1))
-                group.add(Rectangle(texture=tex, pos=(rx, y), size=(run_w, self._char_h)))
-
-            if underline:
-                group.add(Color(fg_rgb[0] / 255, fg_rgb[1] / 255, fg_rgb[2] / 255, 1))
-                group.add(Rectangle(pos=(rx, y + 1), size=(run_w, max(1, int(self._char_h * 0.06)))))
-
-    # -- redraw (throttled, main thread, selective) --------------------------
+    # -- redraw (throttled, main thread) -------------------------------------
 
     def _redraw(self, _dt):
         if not self.screen.is_dirty():
             return
         try:
-            dirty = self.screen.pop_dirty()
+            self.screen.pop_dirty()
             rows, cur_row, cur_col, cursor_visible, scroll_offset = self.screen.get_visible_rows()
 
-            if scroll_offset != 0:
-                # Scrolled into history: row indices in the visible window don't
-                # map 1:1 to live grid row indices, so any change repaints the
-                # whole window. This only happens while the user is browsing
-                # scrollback, not while actively typing at the live prompt.
-                rows_to_redraw = range(len(rows)) if (dirty["all"] or dirty["rows"] or dirty["view"]) else []
-            elif dirty["all"]:
-                rows_to_redraw = range(len(rows))
-            else:
-                rows_to_redraw = sorted(r for r in dirty["rows"] if r < len(rows))
+            self.text_label.text = render_markup(rows)
+            self.text_label.size = (self.screen.cols * self._char_w, self.screen.rows * self._char_h)
+            self.text_label.text_size = self.text_label.size
+            self.text_label.pos = (self.x, self.y + self.height - self.text_label.height)
 
             top_y = self.y + self.height - self._char_h
-            for r in rows_to_redraw:
-                if r >= len(self._row_groups):
-                    continue
-                try:
-                    self._render_row(self._row_groups[r], rows[r], top_y - r * self._char_h)
-                except Exception:
-                    # Isolate a single bad row instead of leaving the whole
-                    # screen blank - the rest of the rows still render.
-                    self._show_internal_error(f"render row {r}", traceback.format_exc())
+            self._render_backgrounds(rows, top_y)
 
             if cursor_visible:
                 self._cursor_color.a = 0.55
@@ -966,7 +941,6 @@ class TerminalView(Widget):
         rows, cols = self._grid_dims_for_size(self.size)
         if (rows, cols) != (self.screen.rows, self.screen.cols):
             self.screen.resize(rows, cols)
-            self._ensure_row_groups(rows)
             self.pty.resize(rows, cols)
 
     # -- scrolling (mouse wheel + touch drag) --------------------------------
