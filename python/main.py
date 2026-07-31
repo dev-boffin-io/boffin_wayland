@@ -845,6 +845,7 @@ class TerminalView(Widget):
                 if not data:
                     if not self.pty.is_alive():
                         self._running = False
+                        self._show_process_exited()
                     continue
                 self.parser.feed(data)  # mutates Screen; marks specific rows/cursor dirty
             except Exception:
@@ -854,6 +855,25 @@ class TerminalView(Widget):
                 # see what broke.
                 self._show_internal_error("read loop", traceback.format_exc())
                 self._running = False
+
+    def _show_process_exited(self):
+        """A dead shell process used to mean the reader thread just quietly
+        stopped with zero visible feedback - identical symptom to a hung
+        blank terminal (no prompt, typing does nothing, no error shown).
+        Now it always leaves a clear message, whether this was a normal
+        `exit` or - if no prompt was ever seen before this - a strong hint
+        that PREFIX/bin/bash itself failed to start (wrong architecture,
+        missing shared library, or a corrupted bootstrap extraction)."""
+        message = (
+            "\r\n\x1b[33m[Boffin-Wayland] shell process exited.\r\n"
+            "If you never saw a prompt before this, bash likely failed to "
+            "start - try clearing the app's storage/data to force a fresh "
+            "bootstrap re-download and extraction.\x1b[0m\r\n"
+        )
+        try:
+            self.parser.feed(message.encode("utf-8", errors="replace"))
+        except Exception:
+            pass
 
     # -- background-color runs (drawn behind the text Label) ---------------
 
@@ -1281,11 +1301,24 @@ class BoffinWaylandApp(App):
         generally don't send real key-down events for these, so without
         this row Ctrl+C, Tab-completion, and Esc (needed for vim/nano)
         wouldn't be reachable at all."""
-        bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=4, padding=(4, 2))
+        bar = BoxLayout(orientation="horizontal", size_hint_x=None, spacing=6, padding=(6, 2))
         bar.bind(minimum_width=bar.setter("width"))
 
-        def add_key(label, on_press, width=56):
-            btn = Button(text=label, size_hint_x=None, width=width)
+        KEY_FONT_SIZE = "13sp"
+
+        def add_key(label, on_press, width=None):
+            # Width defaults to a generous per-character estimate rather
+            # than one fixed number - narrow fixed widths (e.g. 56px) were
+            # too small for labels like "CTRL"/"HOME"/"PGUP" at the default
+            # Button font size, so their text visually overflowed into the
+            # next button and looked like garbled overlapping text.
+            if width is None:
+                width = max(44, 22 + 15 * len(label))
+            btn = Button(
+                text=label, size_hint_x=None, width=width,
+                font_size=KEY_FONT_SIZE, halign="center", valign="middle",
+                text_size=(width - 6, None), shorten=True,
+            )
             btn.bind(on_press=on_press)
             bar.add_widget(btn)
             return btn
@@ -1300,21 +1333,21 @@ class BoffinWaylandApp(App):
         add_key("TAB", special("tab"))
         self.ctrl_btn = add_key("CTRL", lambda _inst: self._toggle_ctrl())
         self.alt_btn = add_key("ALT", lambda _inst: self._toggle_alt())
-        add_key("\u2190", special("left"))
-        add_key("\u2193", special("down"))
-        add_key("\u2191", special("up"))
-        add_key("\u2192", special("right"))
+        add_key("<", special("left"), width=40)
+        add_key("v", special("down"), width=40)
+        add_key("^", special("up"), width=40)
+        add_key(">", special("right"), width=40)
         add_key("HOME", special("home"))
         add_key("END", special("end"))
         add_key("PGUP", special("pageup"))
         add_key("PGDN", special("pagedown"))
-        add_key("/", raw(b"/"), width=40)
-        add_key("-", raw(b"-"), width=40)
-        add_key("|", raw(b"|"), width=40)
-        add_key("~", raw(b"~"), width=40)
+        add_key("/", raw(b"/"), width=44)
+        add_key("-", raw(b"-"), width=44)
+        add_key("|", raw(b"|"), width=44)
+        add_key("~", raw(b"~"), width=44)
 
         scroll = ScrollView(
-            size_hint=(1, None), height=44, do_scroll_x=True, do_scroll_y=False,
+            size_hint=(1, None), height=48, do_scroll_x=True, do_scroll_y=False,
             bar_width=4,
         )
         scroll.add_widget(bar)
