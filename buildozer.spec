@@ -32,7 +32,24 @@ fullscreen = 0
 # forkpty()/openpty() require API 23+ on bionic - keep this in sync with
 # MIN_API in cpp/build_native.sh
 android.minapi = 24
-android.api = 34
+# THE FIX for "shell process exits immediately, no prompt ever appears":
+# Android 10+ (targetSdkVersion >= 29) blocks execve() on any file inside
+# the app's own writable data directory (a W^X / SELinux restriction -
+# see https://developer.android.com/about/versions/10/behavior-changes-all#execute-permission).
+# Our bootstrap downloads bash into PREFIX/bin and chmod +x's it there -
+# exactly the pattern this restriction blocks. Termux hit this identical
+# issue (https://github.com/termux/termux-app/issues/1072) and historically
+# fixed it the same way: pin targetSdkVersion below 29. Real Termux's
+# *current* shipped builds instead route execution through the system
+# dynamic linker (a much larger C-level undertaking, "termux-exec" /
+# system_linker_exec) to stay on a modern targetSdkVersion for Play Store
+# eligibility - not needed here since this isn't a Play Store app.
+# NOTE: some newer Android Gradle Plugin versions require a higher
+# compileSdkVersion floor than 28 to build at all - if this specific
+# change causes a *new* Gradle-level build error (not a runtime exec
+# error), that's what's happening; the real fix then is the more involved
+# system-linker-exec approach instead of a simple version pin.
+android.api = 28
 android.ndk = 25b
 android.archs = arm64-v8a, armeabi-v7a
 
