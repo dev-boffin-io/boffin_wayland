@@ -175,9 +175,13 @@ class BootstrapManager:
         )
 
     def ensure_bootstrap(self):
-        """Idempotent: does nothing if a shell already exists at PREFIX."""
+        """Idempotent: skips the download/extract if a shell already exists
+        at PREFIX, but still runs the hardcoded-path patch either way (see
+        _patch_hardcoded_termux_paths) since that needs to reach installs
+        that were bootstrapped before this patch existed too."""
         if self.shell_present():
             self.on_status("Bootstrap already present.")
+            self._patch_hardcoded_termux_paths()
             self.on_progress(1.0)
             return
 
@@ -216,8 +220,79 @@ class BootstrapManager:
                 "unexpected zip contents."
             )
 
+        self._patch_hardcoded_termux_paths()
+
         self.on_status("Bootstrap ready.")
         self.on_progress(1.0)
+
+    # -- hardcoded-path patching --------------------------------------------
+
+    # Per Termux's own docs (termux-packages wiki, "Termux file system
+    # layout"): "All hardcoded references to FHS directories in package
+    # source files are patched and replaced with Termux prefix directory
+    # during build time" - i.e. the *official* bootstrap we download is
+    # baked, at Termux's own build time, for their fixed package name
+    # (com.termux), not ours. This is why a fresh bash login shell prints
+    # `bash: /data/data/com.termux/files/usr/etc/profile: Permission
+    # denied` on first run: that path belongs to a different app (or
+    # doesn't exist at all on this device) and Android's per-app sandboxing
+    # correctly refuses cross-app access to it.
+    #
+    # HONEST LIMITATION: this only patches plain-text config files (shell
+    # profile scripts under etc/) - the specific thing causing the visible
+    # warning. It does NOT patch compiled-in path strings inside ELF
+    # binaries (e.g. dpkg/apt embed their own hardcoded paths at compile
+    # time), so package management commands may still misbehave under a
+    # different package name. The complete fix is building a bootstrap
+    # from termux-packages' own build-bootstraps.sh with
+    # TERMUX_APP_PACKAGE set to this project's package name - a separate,
+    # larger undertaking (needs a local apt repo + Docker build) tracked
+    # as future work, not attempted here.
+    REAL_TERMUX_FILES_DIR = "/data/data/com.termux/files"
+    PATCH_SUBDIRS = ("etc",)  # only plain-text-config directories - never touch bin/lib (ELF binaries)
+
+    def _patch_hardcoded_termux_paths(self):
+        our_files_dir = os.path.dirname(self.prefix.rstrip("/"))  # .../files
+        if our_files_dir == self.REAL_TERMUX_FILES_DIR:
+            return  # package name genuinely is com.termux - nothing to patch
+
+        patched_count = 0
+        for subdir in self.PATCH_SUBDIRS:
+            root = os.path.join(self.prefix, subdir)
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for fname in filenames:
+                    fpath = os.path.join(dirpath, fname)
+                    if os.path.islink(fpath) or not os.path.isfile(fpath):
+                        continue
+                    if self._patch_one_file(fpath):
+                        patched_count += 1
+
+        if patched_count:
+            self.on_status(
+                f"Patched {patched_count} config file(s) referencing the real Termux's path."
+            )
+
+    def _patch_one_file(self, fpath: str) -> bool:
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False  # not a text file (or unreadable) - leave it alone
+
+        if self.REAL_TERMUX_FILES_DIR not in text:
+            return False
+
+        our_files_dir = os.path.dirname(self.prefix.rstrip("/"))
+        patched = text.replace(self.REAL_TERMUX_FILES_DIR, our_files_dir)
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(patched)
+        except OSError:
+            return False
+        return True
 
     # -- internals --------------------------------------------------------
 
