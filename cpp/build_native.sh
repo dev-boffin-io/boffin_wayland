@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Cross-compiles libptycore.so and liblorie_bridge.so for every Android ABI
-# using the NDK's CMake toolchain file, and copies the results into
-# ../libs/<abi>/ so buildozer.spec can bundle them straight into the APK.
+# Cross-compiles libptycore.so, liblorie_bridge.so, and libexec_shim.so for
+# every Android ABI using the NDK's CMake toolchain file, and copies the
+# results into ../libs/<abi>/ so buildozer.spec can bundle them straight
+# into the APK.
 #
 # Requirements:
 #   - Android NDK installed (set ANDROID_NDK_HOME below or export it yourself)
@@ -17,10 +18,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_ROOT="${SCRIPT_DIR}/../libs"
-MIN_API=24   # forkpty()/openpty() require API 23+ on bionic
+MIN_API=23   # forkpty()/openpty() require API 23+ on bionic
 
 ABIS=("arm64-v8a" "armeabi-v7a" "x86_64")
-TARGETS=("ptycore" "lorie_bridge")
+TARGETS=("ptycore" "lorie_bridge" "exec_shim")
 
 for ABI in "${ABIS[@]}"; do
     echo "== Building for ${ABI} =="

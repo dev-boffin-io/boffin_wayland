@@ -32,24 +32,33 @@ fullscreen = 0
 # forkpty()/openpty() require API 23+ on bionic - keep this in sync with
 # MIN_API in cpp/build_native.sh
 android.minapi = 24
-# THE FIX for "shell process exits immediately, no prompt ever appears":
-# Android 10+ (targetSdkVersion >= 29) blocks execve() on any file inside
-# the app's own writable data directory (a W^X / SELinux restriction -
-# see https://developer.android.com/about/versions/10/behavior-changes-all#execute-permission).
-# Our bootstrap downloads bash into PREFIX/bin and chmod +x's it there -
-# exactly the pattern this restriction blocks. Termux hit this identical
-# issue (https://github.com/termux/termux-app/issues/1072) and historically
-# fixed it the same way: pin targetSdkVersion below 29. Real Termux's
-# *current* shipped builds instead route execution through the system
-# dynamic linker (a much larger C-level undertaking, "termux-exec" /
-# system_linker_exec) to stay on a modern targetSdkVersion for Play Store
-# eligibility - not needed here since this isn't a Play Store app.
-# NOTE: some newer Android Gradle Plugin versions require a higher
-# compileSdkVersion floor than 28 to build at all - if this specific
-# change causes a *new* Gradle-level build error (not a runtime exec
-# error), that's what's happening; the real fix then is the more involved
-# system-linker-exec approach instead of a simple version pin.
-android.api = 28
+# STATUS UPDATE: android.api is back up to 34. The temporary fix (pinning
+# this to 28 - see git history for the full original explanation of why
+# Android 10+'s targetSdkVersion>=29 W^X restriction blocks bash from
+# execve()-ing out of PREFIX) has been superseded by the real fix:
+# system_linker_exec, implemented across:
+#   - cpp/system_linker_helpers.h   (shared ELF/shebang analysis logic)
+#   - cpp/pty_core.cpp               (redirects the initial bash spawn)
+#   - cpp/exec_shim.cpp              (LD_PRELOAD-ed into bash so every
+#                                      command bash itself runs afterward -
+#                                      ls, cat, nano, python3, etc. - gets
+#                                      the same redirect, not just bash's
+#                                      own startup)
+# The core mechanism (execve() the system's own dynamic linker with the
+# real target as its first argument) was verified end-to-end on a Linux
+# host standing in for Android's linker64 - see the project's test notes.
+# It has NOT yet been verified against Android's actual bionic linker64 on
+# a real device, which is a meaningfully different environment (SELinux
+# policy, APEX linker paths, bionic-specific linker behavior).
+#
+# IF THIS BUILD RUNS BUT BASH FAILS TO START AGAIN: that means something
+# about real device/bionic behavior differs from what was tested here.
+# Bisect by temporarily setting android.api back to 28 - if that fixes it,
+# the problem is specifically in the system_linker_exec path (check logcat
+# for "BoffinSystemLinkerExec" tag messages, which log every redirect
+# decision and failure reason); if 28 *also* fails now, something else
+# changed (e.g. the new exec_shim.so isn't being packaged/loaded).
+android.api = 34
 android.ndk = 25b
 android.archs = arm64-v8a, armeabi-v7a
 
@@ -60,8 +69,8 @@ android.permissions = INTERNET
 
 # Prebuilt native libraries produced by cpp/build_native.sh
 # (run that script BEFORE `buildozer android debug`)
-android.add_libs_arm64_v8a = libs/arm64-v8a/libptycore.so, libs/arm64-v8a/liblorie_bridge.so
-android.add_libs_armeabi_v7a = libs/armeabi-v7a/libptycore.so, libs/armeabi-v7a/liblorie_bridge.so
+android.add_libs_arm64_v8a = libs/arm64-v8a/libptycore.so, libs/arm64-v8a/liblorie_bridge.so, libs/arm64-v8a/libexec_shim.so
+android.add_libs_armeabi_v7a = libs/armeabi-v7a/libptycore.so, libs/armeabi-v7a/liblorie_bridge.so, libs/armeabi-v7a/libexec_shim.so
 
 # Extra Java source (com.boffin.wayland.LorieSurfaceView - the native X11
 # display surface, see android_src/ and cpp/lorie_bridge.cpp). NOTE: the

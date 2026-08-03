@@ -578,6 +578,39 @@ class BusyboxManager:
         return linked
 
 
+def _find_native_lib_dir():
+    """Returns the absolute directory Android extracted this app's bundled
+    .so files into (libptycore.so, liblorie_bridge.so, libexec_shim.so) -
+    needed to build an absolute LD_PRELOAD path for the system_linker_exec
+    workaround (see PtyCore.spawn_shell()). A bare filename isn't reliable
+    here since bash's environment is built from scratch for the forked
+    child rather than inheriting this process's own LD_LIBRARY_PATH.
+    Returns None if it can't be determined (e.g. running outside Android),
+    in which case LD_PRELOAD is simply omitted - bash itself still starts
+    fine via pty_core.cpp's own redirect, just without the benefit of
+    exec_shim covering commands bash runs afterward."""
+    try:
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        return activity.getApplicationInfo().nativeLibraryDir
+    except Exception:
+        pass
+
+    # Fallback for non-Android testing: find where libptycore.so was
+    # actually loaded from (works because PtyCore.__init__ already
+    # successfully CDLL()s it before spawn_shell() ever runs).
+    try:
+        with open("/proc/self/maps") as f:
+            for line in f:
+                if "libptycore.so" in line:
+                    path = line.rsplit(None, 1)[-1]
+                    return os.path.dirname(path)
+    except OSError:
+        pass
+
+    return None
+
+
 class PtyCoreError(RuntimeError):
     pass
 
@@ -632,6 +665,14 @@ class PtyCore:
 
         argv = self._to_c_array([shell_path, "-l"])
 
+        # BOFFIN_EXEC_DATA_DIR: the "needs system_linker_exec redirect"
+        # prefix both pty_core.cpp (this initial bash spawn) and
+        # exec_shim.cpp (every command bash runs afterward) check against -
+        # see system_linker_helpers.h for the full explanation of why this
+        # workaround exists at all (Android 10+ targetSdkVersion>=29 blocks
+        # execve() on files inside the app's own writable data directory).
+        app_files_dir = os.path.dirname(PREFIX.rstrip("/"))
+
         env_list = [
             f"PREFIX={PREFIX}",
             f"HOME={HOME}",
@@ -640,7 +681,21 @@ class PtyCore:
             f"TMPDIR={PREFIX}/tmp",
             "TERM=xterm-256color",
             "LANG=en_US.UTF-8",
+            f"BOFFIN_EXEC_DATA_DIR={app_files_dir}",
         ]
+
+        native_lib_dir = _find_native_lib_dir()
+        if native_lib_dir:
+            exec_shim_path = os.path.join(native_lib_dir, "libexec_shim.so")
+            if os.path.exists(exec_shim_path):
+                # LD_PRELOAD is what makes the redirect apply to every
+                # command bash itself runs (ls, cat, nano, python3, ...),
+                # not just bash's own startup exec (which pty_core.cpp
+                # already handles independently of this). It's inherited
+                # by bash's children automatically since env vars survive
+                # exec() unless a program explicitly clears them.
+                env_list.append(f"LD_PRELOAD={exec_shim_path}")
+
         envp = self._to_c_array(env_list)
 
         out_fd = c_int(-1)
