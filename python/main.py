@@ -189,30 +189,43 @@ class BootstrapManager:
         os.makedirs(parent_dir, exist_ok=True)
 
         arch = self._detect_arch()
-        self.on_status(f"Looking up latest bootstrap for {arch}...")
-        release = self._find_latest_bootstrap_release()
-        asset_url, expected_sha256 = self._asset_url_and_hash(release, arch)
 
-        tmp_zip = os.path.join(parent_dir, f"bootstrap-{arch}.zip")
-        try:
-            self._download(asset_url, tmp_zip)
+        # A custom-built bootstrap (see docs_BUILDING_CUSTOM_BOOTSTRAP.md -
+        # built from source via termux-packages' build-bootstraps.sh with
+        # TERMUX_APP_PACKAGE=com.boffin.wayland) takes priority if it's
+        # been bundled into the APK: no network needed, and every path -
+        # including ones compiled into ELF binaries like apt/dpkg, which
+        # _patch_hardcoded_termux_paths() below can never reach - is
+        # already correct from build time.
+        bundled_zip = self._bundled_bootstrap_path(arch)
+        if bundled_zip and os.path.exists(bundled_zip):
+            self.on_status(f"Using bundled custom bootstrap for {arch}...")
+            self._extract(bundled_zip)
+        else:
+            self.on_status(f"Looking up latest bootstrap for {arch}...")
+            release = self._find_latest_bootstrap_release()
+            asset_url, expected_sha256 = self._asset_url_and_hash(release, arch)
 
-            if expected_sha256:
-                self.on_status("Verifying checksum...")
-                actual = self._sha256_of(tmp_zip)
-                if actual.lower() != expected_sha256.lower():
-                    raise BootstrapError(
-                        "Checksum mismatch on downloaded bootstrap "
-                        f"(expected {expected_sha256}, got {actual}) - "
-                        "refusing to install a corrupted/tampered archive."
-                    )
-            else:
-                self.on_status("No published checksum found for this release, skipping verification.")
+            tmp_zip = os.path.join(parent_dir, f"bootstrap-{arch}.zip")
+            try:
+                self._download(asset_url, tmp_zip)
 
-            self._extract(tmp_zip)
-        finally:
-            if os.path.exists(tmp_zip):
-                os.remove(tmp_zip)
+                if expected_sha256:
+                    self.on_status("Verifying checksum...")
+                    actual = self._sha256_of(tmp_zip)
+                    if actual.lower() != expected_sha256.lower():
+                        raise BootstrapError(
+                            "Checksum mismatch on downloaded bootstrap "
+                            f"(expected {expected_sha256}, got {actual}) - "
+                            "refusing to install a corrupted/tampered archive."
+                        )
+                else:
+                    self.on_status("No published checksum found for this release, skipping verification.")
+
+                self._extract(tmp_zip)
+            finally:
+                if os.path.exists(tmp_zip):
+                    os.remove(tmp_zip)
 
         if not self.shell_present():
             raise BootstrapError(
@@ -224,6 +237,16 @@ class BootstrapManager:
 
         self.on_status("Bootstrap ready.")
         self.on_progress(1.0)
+
+    @staticmethod
+    def _bundled_bootstrap_path(arch: str):
+        """Path to a custom-built bootstrap bundled in the APK under
+        assets/bootstrap/bootstrap-<arch>.zip, if one has been built and
+        dropped in there. See docs_BUILDING_CUSTOM_BOOTSTRAP.md for how to
+        build one - it needs Docker and a few hours, so it's a separate,
+        manual, one-time step, not something this app does at runtime."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(here, "assets", "bootstrap", f"bootstrap-{arch}.zip")
 
     # -- hardcoded-path patching --------------------------------------------
 
@@ -374,6 +397,51 @@ class BootstrapManager:
                 h.update(chunk)
         return h.hexdigest()
 
+    @staticmethod
+    def _detect_zip_root_prefix(names):
+        """Some custom-built bootstraps get zipped directly from a Docker
+        container's live /data/data/<pkg>/files/usr tree (e.g. a plain
+        `zip -r` of that directory) rather than using build-bootstraps.sh's
+        own output, which - like the official Termux releases - is already
+        zip-root-relative (bin/, etc/, lib/, ... with no leading path).
+        The former has EVERY real entry prefixed with the full absolute
+        path instead. Detects that via the '/files/usr/' marker (present
+        in any Android app's data directory layout regardless of package
+        name) and returns the prefix to strip, or '' if the zip already
+        looks like the normal relative format - so extraction handles
+        either correctly without the caller needing to know which one it
+        got.
+
+        Confirmed against a real custom-built bootstrap zip: the marker
+        can appear on any entry, not necessarily the first one (a zip
+        commonly lists ancestor-directory placeholder entries first - e.g.
+        "data/", "data/data/", "data/data/<pkg>/", ... on the way down to
+        the real prefix - each of which is itself a *prefix of* the
+        target prefix rather than prefixed by it, so those don't count
+        against the detection)."""
+        if not names:
+            return ""
+
+        marker = "/files/usr/"
+        prefix = None
+        for name in names:
+            idx = name.find(marker)
+            if idx != -1:
+                prefix = name[: idx + len(marker)]
+                break
+        if prefix is None:
+            return ""
+
+        for name in names:
+            if name == "SYMLINKS.txt":
+                continue
+            if name.startswith(prefix):
+                continue
+            if prefix.startswith(name):
+                continue  # ancestor directory placeholder (e.g. "data/data/") - harmless
+            return ""  # something unexpected - don't trust the guess
+        return prefix
+
     def _extract(self, zip_path: str):
         self.on_status("Extracting bootstrap files...")
         staging = self.prefix.rstrip("/") + ".staging"
@@ -381,17 +449,38 @@ class BootstrapManager:
             shutil.rmtree(staging)
         os.makedirs(staging, exist_ok=True)
 
-        # Termux bootstrap zips don't store real symlinks (zip has no clean
-        # cross-platform symlink support); instead a SYMLINKS.txt lists them
-        # as "target<-arrow>link_path", one per line, using the U+2190 (<-)
-        # character as separator. We recreate them for real after extraction.
+        # Bootstrap zips represent symlinks one of two ways depending on how
+        # they were produced:
+        #   1. The official generate-bootstraps.sh release format: a
+        #      SYMLINKS.txt listing them as "target<-arrow>link_path", one
+        #      per line (U+2190 separator) - zip itself has no clean
+        #      cross-platform symlink support, so this sidesteps that.
+        #   2. build-bootstraps.sh's own output (confirmed by inspecting a
+        #      real custom-built bootstrap): real zip entries with Unix
+        #      symlink mode bits set in external_attr, whose "file content"
+        #      is the target path string (the standard info-zip symlink
+        #      convention). Without checking for this, our extractor used
+        #      to write these as regular files literally containing the
+        #      target path text instead of creating an actual symlink.
+        # Both are collected into the same pending_symlinks list and
+        # created for real in one pass after extraction, regardless of
+        # which convention (or a mix of both) a given zip uses.
         pending_symlinks = []  # (target, link_path_relative_to_prefix)
 
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
-                names = zf.namelist()
-                total = len(names) or 1
-                for i, name in enumerate(names):
+                infos = zf.infolist()
+                total = len(infos) or 1
+
+                root_prefix = self._detect_zip_root_prefix([info.filename for info in infos])
+                if root_prefix:
+                    self.on_status(
+                        f"Detected absolute-path zip layout, stripping '{root_prefix}' from every entry..."
+                    )
+
+                for i, info in enumerate(infos):
+                    name = info.filename
+
                     if name == "SYMLINKS.txt":
                         with zf.open(name) as f:
                             text = f.read().decode("utf-8")
@@ -406,7 +495,28 @@ class BootstrapManager:
                         self.on_progress((i + 1) / total)
                         continue
 
-                    target_path = os.path.join(staging, name)
+                    if root_prefix:
+                        if not name.startswith(root_prefix):
+                            # Ancestor directory placeholder (e.g. "data/",
+                            # "data/data/") - nothing to extract, parent
+                            # dirs get created via makedirs() below anyway.
+                            self.on_progress((i + 1) / total)
+                            continue
+                        rel_name = name[len(root_prefix):]
+                    else:
+                        rel_name = name
+
+                    if not rel_name:
+                        continue  # the root directory entry itself, nothing to extract
+
+                    unix_mode = (info.external_attr >> 16) & 0xFFFF
+                    if stat.S_ISLNK(unix_mode):
+                        target = zf.read(name).decode("utf-8", errors="replace")
+                        pending_symlinks.append((target, rel_name))
+                        self.on_progress((i + 1) / total)
+                        continue
+
+                    target_path = os.path.join(staging, rel_name)
                     if name.endswith("/"):
                         os.makedirs(target_path, exist_ok=True)
                     else:
@@ -1377,17 +1487,35 @@ class BoffinWaylandApp(App):
             self._on_bootstrap_status(f"[ERROR] Bootstrap failed: {exc}")
             return
 
-        busybox_manager = BusyboxManager(
-            PREFIX,
-            on_status=self._on_bootstrap_status,
-            on_progress=self._on_bootstrap_progress,
-        )
-        try:
-            busybox_manager.ensure_busybox()
-        except BusyboxError as exc:
-            # Not fatal - bash/sh from the Termux bootstrap already work on
-            # their own; BusyBox just adds extra commands on top.
-            self._on_bootstrap_status(f"[WARNING] BusyBox install failed: {exc} (continuing without it)")
+        # BusyboxManager is intentionally NOT called here right now.
+        # Our bundled BusyBox binary is statically linked, and
+        # system_linker_exec (see system_linker_helpers.h) fundamentally
+        # cannot redirect statically-linked executables - confirmed on a
+        # real device, it fails with ENOEXEC every time, regardless of how
+        # it's invoked. Termux's own official bootstrap (which
+        # BootstrapManager already downloads) ships a very large set of
+        # dynamically-linked utilities on its own (dpkg, apt, awk, sed,
+        # tar, curl-equivalents, 300+ commands total - see a real `ls
+        # PREFIX/bin` listing), so the extra commands BusyBox was meant to
+        # add may not even be needed. The plan going forward is a custom-
+        # built bootstrap (via termux-packages' own build-bootstraps.sh
+        # with TERMUX_APP_PACKAGE set to this project's package name) -
+        # tracked as a separate, larger future step - rather than trying
+        # to patch in a static BusyBox binary that can't run under
+        # targetSdkVersion 29+ no matter what. The BusyboxManager class
+        # itself is left in place below in case a dynamically-linked
+        # BusyBox build becomes available later; re-enable by uncommenting
+        # the block below.
+        #
+        # busybox_manager = BusyboxManager(
+        #     PREFIX,
+        #     on_status=self._on_bootstrap_status,
+        #     on_progress=self._on_bootstrap_progress,
+        # )
+        # try:
+        #     busybox_manager.ensure_busybox()
+        # except BusyboxError as exc:
+        #     self._on_bootstrap_status(f"[WARNING] BusyBox install failed: {exc} (continuing without it)")
 
         self.font_path = _ensure_monospace_font(on_status=self._on_bootstrap_status)
 
