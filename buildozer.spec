@@ -5,9 +5,16 @@ package.name = wayland
 package.domain = com.boffin
 
 source.dir = python
-source.include_exts = py,png,jpg,kv,atlas,ttf
+source.include_exts = py,png,jpg,kv,atlas,ttf,zip
 # busybox-aarch64 has no file extension, so include_exts (extension-based)
 # won't catch it - include_patterns (glob-based) is needed for that.
+# NOTE: 'zip' was added to source.include_exts above (not just relying on
+# source.include_patterns below) after a real device test showed
+# bootstrap-aarch64.zip never made it into the built APK - the busybox
+# binary (no file extension) was bundled fine via include_patterns alone,
+# but a real-world buildozer report found a similarly-extensioned asset
+# needing the extension listed in include_exts too, not just matched by
+# include_patterns. Both are now set for the bootstrap zip to be safe.
 source.include_patterns = assets/busybox/*, assets/bootstrap/*
 version = 0.1.0
 
